@@ -1,0 +1,163 @@
+name: Build iOS JDK libraries
+
+# Produces libjava.a and libjvm.a for iphoneos arm64.
+# Uses setup-xcode to select the latest stable Xcode on macos-15.
+# Both Xcode projects use SDKROOT=iphoneos (no hardcoded version), so they
+# build against whatever iOS SDK ships with the selected Xcode.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      # Submodule URLs in .gitmodules use SSH (git@github.com:…), which fails
+      # on GitHub Actions without a deploy key. Override to HTTPS before init.
+      - name: Checkout (without submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Override submodule SSH URLs to HTTPS
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Get submodule SHAs (for cache keys)
+        id: shas
+        run: |
+          echo "openjdk=$(git rev-parse HEAD:labs-openjdk/labs-openjdk-21)" >> $GITHUB_OUTPUT
+          echo "graal=$(git rev-parse HEAD:svm/graal)"                       >> $GITHUB_OUTPUT
+
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
+
+      # ── Xcode ─────────────────────────────────────────────────────────────
+      # setup-xcode switches between pre-installed versions on the runner.
+      # latest-stable picks the newest non-beta Xcode available on macos-15.
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      # Capture the active Xcode path so build.sh and xcodebuild calls all
+      # agree on the same toolchain (XCODE_DEVELOPER_DIR env var is read by
+      # build.sh instead of the hardcoded local path).
+      - name: Export XCODE_DEVELOPER_DIR
+        run: echo "XCODE_DEVELOPER_DIR=$(xcode-select -p)" >> $GITHUB_ENV
+
+      # ── System dependencies ───────────────────────────────────────────────
+      - name: Install build tools
+        run: brew install mx
+
+      # ── Boot JDK (labsjdk-ce-21) ──────────────────────────────────────────
+      - name: Cache Boot JDK
+        id: cache-boot-jdk
+        uses: actions/cache@v4
+        with:
+          path: boot-jdk-21
+          key: boot-jdk-labsjdk-ce-21-v1
+
+      - name: Fetch Boot JDK
+        if: steps.cache-boot-jdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p boot-jdk-21
+          mx -y --no-warning fetch-jdk \
+            --java-distribution labsjdk-ce-21 \
+            --to "$PWD/boot-jdk-21" \
+            --alias jdk21
+
+      - name: Set JAVA_HOME
+        run: echo "JAVA_HOME=$PWD/boot-jdk-21/jdk21/Contents/Home" >> $GITHUB_ENV
+
+      # ── iOS patch ─────────────────────────────────────────────────────────
+      - name: Apply iOS patch to labs-openjdk-21
+        run: |
+          cd labs-openjdk/labs-openjdk-21
+          if git apply --check ../ios-jdk.patch 2>/dev/null; then
+            git apply ../ios-jdk.patch
+          else
+            echo "Patch already applied or not applicable — skipping"
+          fi
+
+      # ── Stage 1: make static-libs-image (macOS host build, ~20-30 min) ───
+      # Cached by the labs-openjdk-21 submodule commit SHA.
+      - name: Cache static-libs-image build
+        id: cache-static-libs
+        uses: actions/cache@v4
+        with:
+          path: labs-openjdk/labs-openjdk-21/build
+          key: static-libs-macos15-${{ steps.shas.outputs.openjdk }}
+
+      - name: Build static-libs-image
+        if: steps.cache-static-libs.outputs.cache-hit != 'true'
+        run: |
+          cd labs-openjdk/labs-openjdk-21
+          env -u DEVELOPER_DIR \
+              -u CC -u CXX -u CFLAGS -u CXXFLAGS -u LDFLAGS \
+              -u SDKROOT -u ARCHFLAGS -u SYSROOT \
+              ./build.sh
+
+      # ── Stage 2: libjava.a (Xcode, iOS arm64) ────────────────────────────
+      - name: Cache libjava.a build
+        id: cache-libjava
+        uses: actions/cache@v4
+        with:
+          path: labs-openjdk/build/xcode/Release-ios-iphoneos
+          key: libjava-macos15-${{ steps.shas.outputs.openjdk }}
+
+      - name: Build libjava.a
+        if: steps.cache-libjava.outputs.cache-hit != 'true'
+        run: |
+          XCODE_CLANG="$XCODE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+          cd labs-openjdk
+          xcodebuild \
+            -scheme libjava \
+            -sdk iphoneos \
+            -configuration Release-ios \
+            -UseModernBuildSystem=NO \
+            CC="$XCODE_CLANG" \
+            CXX="${XCODE_CLANG}++"
+
+      # ── Stage 3: libjvm.a (Xcode, iOS arm64) ─────────────────────────────
+      - name: Cache libjvm.a build
+        id: cache-libjvm
+        uses: actions/cache@v4
+        with:
+          path: svm/build/xcode/Release-ios-iphoneos
+          key: libjvm-macos15-${{ steps.shas.outputs.graal }}
+
+      - name: Build libjvm.a
+        if: steps.cache-libjvm.outputs.cache-hit != 'true'
+        run: |
+          XCODE_CLANG="$XCODE_DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+          cd svm
+          xcodebuild \
+            -scheme libjvm \
+            -sdk iphoneos \
+            -configuration Release-ios \
+            -UseModernBuildSystem=NO \
+            CC="$XCODE_CLANG" \
+            CXX="${XCODE_CLANG}++"
+
+      # ── Collect and upload ─────────────────────────────────────────────────
+      # build/ios-arm64/lib/    → libjava.a, libjvm.a   (iOS-targeted)
+      # build/ios-arm64/static/ → *.a from static-libs-image (POSIX-compatible)
+      - name: Collect artifacts
+        run: |
+          mkdir -p build/ios-arm64/{lib,static}
+          cp svm/build/xcode/Release-ios-iphoneos/libjvm.a         build/ios-arm64/lib/
+          cp labs-openjdk/build/xcode/Release-ios-iphoneos/libjava.a build/ios-arm64/lib/
+          cp labs-openjdk/labs-openjdk-21/build/labsjdk/images/static-libs/lib/*.a \
+             build/ios-arm64/static/
+
+      - name: Upload ios-jdk-libs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-jdk-libs-arm64
+          path: build/ios-arm64/
+          retention-days: 30

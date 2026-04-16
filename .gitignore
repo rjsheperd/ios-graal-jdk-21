@@ -1,0 +1,33 @@
+# ── Build outputs ─────────────────────────────────────────────────────────────
+build/
+labs-openjdk/build/
+svm/build/
+
+# ── Boot JDK (fetched via mx fetch-jdk) ──────────────────────────────────────
+boot-jdk-21/
+
+# ── GraalVM CAP cache (stale native code causes silent test failures) ─────────
+conf/capcache/
+
+# ── Xcode user data ───────────────────────────────────────────────────────────
+# **/ prefix is required — patterns containing / are anchored to the repo root,
+# so *.xcodeproj/xcuserdata/ would NOT match labs-openjdk/foo.xcodeproj/xcuserdata/.
+**/*.xcworkspace/xcuserdata/
+**/*.xcodeproj/xcuserdata/
+**/*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── Nix ───────────────────────────────────────────────────────────────────────
+result
+result-*
+
+# ── direnv ────────────────────────────────────────────────────────────────────
+.envrc
+
+# ── Claude ────────────────────────────────────────────────────────────────────
+.claude
+
+

@@ -1,0 +1,277 @@
+#+TITLE: JDK 21 for iOS
+
+Builds JDK 21 as static libraries (~libjava.a~ and ~libjvm.a~) for iOS (arm64).
+Embed both libraries in a native iOS app to run Java on-device.
+
+* Prerequisites
+
+| Tool | Version | How to get |
+|------+---------+------------|
+| Xcode | 14.3.1 | Direct download from [[https://developer.apple.com/download/all/][developer.apple.com]] |
+| iOS SDK | 16.4 | Included in Xcode 14.3.1 |
+| conda | any | ~brew install --cask miniconda~ |
+| mx | any | ~brew install mx~ |
+| GraalVM | 23.1.3 | via ~mx fetch-jdk~ (see below) |
+
+* One-time Setup
+
+** 1. Pin Xcode 14.3.1
+
+~xcodebuild~'s build daemon uses ~xcode-select~ — not ~DEVELOPER_DIR~ — to locate
+its toolchain. Using the wrong Xcode produces a mismatched VFS stat cache and
+~stdio.h not found~ errors. Pin the system to Xcode 14.3.1 once:
+
+#+BEGIN_SRC bash
+sudo xcode-select -s /path/to/Xcode-14.3.1.app
+#+END_SRC
+
+Verify it:
+
+#+BEGIN_SRC bash
+xcode-select -p   # must print the Xcode 14.3.1 path
+xcodebuild -version   # must print "Xcode 14.3.1"
+#+END_SRC
+
+** 2. Clone the repo with submodules
+
+#+BEGIN_SRC bash
+git clone git@github.com:rjsheperd/ios-graal-jdk-21.git --recurse-submodules
+cd ios-graal-jdk-21
+#+END_SRC
+
+If you already cloned without submodules:
+
+#+BEGIN_SRC bash
+git submodule update --init --recursive
+#+END_SRC
+
+** 3. Apply the iOS patch
+
+The patch adds ~TARGET_OS_IPHONE~ guards to the JDK's networking/IO sources.
+Apply it once after a fresh submodule checkout:
+
+#+BEGIN_SRC bash
+cd labs-openjdk/labs-openjdk-21
+git apply ../ios-jdk.patch
+cd ../..
+#+END_SRC
+
+** 4. Fetch the Boot JDK
+
+#+BEGIN_SRC bash
+mx -y --no-warning fetch-jdk --java-distribution labsjdk-ce-21 \
+   --to boot-jdk-21/ --alias jdk21
+export JAVA_HOME=$PWD/boot-jdk-21/jdk21/Contents/Home
+#+END_SRC
+
+* Build
+
+** Option A — Nix dev shell (recommended)
+
+The Nix shell sets ~JAVA_HOME~ and ~DEVELOPER_DIR~ and warns if ~xcode-select~ is
+pointing at the wrong Xcode:
+
+#+BEGIN_SRC bash
+nix develop
+./build.sh
+#+END_SRC
+
+** Option B — bare shell
+
+#+BEGIN_SRC bash
+export JAVA_HOME=$PWD/boot-jdk-21/jdk21/Contents/Home
+./build.sh
+#+END_SRC
+
+~build.sh~ will abort immediately with a fix hint if ~xcode-select~ is not pointing
+at Xcode 14.3.1.
+
+* Outputs
+
+After a successful build, the libraries are in ~build/ios-arm64/lib/~:
+
+#+BEGIN_EXAMPLE
+build/
+└── ios-arm64/
+    └── lib/
+        ├── libjava.a   ← JDK core Java native layer
+        └── libjvm.a    ← GraalVM SubstrateVM JVM
+#+END_EXAMPLE
+
+Link both ~libjava.a~ and ~libjvm.a~ into your iOS app target to enable Java
+execution on-device.
+
+* Architecture
+
+The build has three stages, orchestrated by the top-level ~build.sh~:
+
+** Stage 1 — ~labs-openjdk/labs-openjdk-21/~
+
+Patched labsJDK 21 source (git submodule). The inner ~build.sh~ runs
+~./configure~ with the *macOS* SDK and system clang — no iOS flags.  This keeps
+host build tools like ~adlc~ compiling as macOS binaries so they can actually
+execute.  iOS-specific code is handled entirely by the Xcode projects in stages
+2 and 3.
+
+Produces: ~static-libs-image~ (headers + intermediate static libs).
+
+** Stage 2 — ~labs-openjdk/svm.openjdk.xcodeproj~
+
+Xcode project that compiles the JDK's native C sources (networking, I/O, etc.)
+into ~libjava.a~ for ~iphoneos16.4~. This is where ~ios-jdk.patch~ takes effect
+(~TARGET_OS_IPHONE~ guards). Built with ~-UseModernBuildSystem=NO~ so clang is
+invoked directly from the pinned Xcode 14.3.1 toolchain via ~CC=~.
+
+** Stage 3 — ~svm/graal/~ + ~svm/svm.graal.xcodeproj~
+
+GraalVM SubstrateVM source (git submodule). ~svm/src/main/native/JvmFuncsFallbacks.c~
+provides iOS-compatible fallback implementations of JVM functions. The Xcode
+project compiles these into ~libjvm.a~ under the same constraints as Stage 2.
+
+* Building bb.o (Clojure → iOS native object)
+
+After ~./build.sh~ completes, ~scripts/build-bb-o~ compiles a Clojure project to
+~bb.o~ using the libraries produced by this project.
+
+** Prerequisites
+
+- GraalVM Gluon with iOS platform support ([[https://github.com/gluonhq/graal/releases][gluonhq/graal releases]])
+- ~clojure~ CLI
+
+** Pipeline overview
+
+#+BEGIN_SRC
+./build.sh                         stage 0 — JDK native libs (one-time, ~1hr)
+  └─> build/ios-arm64/lib/
+      build/ios-arm64/static/
+
+./scripts/build-bb-o               stage 1 — Clojure → bb.o (minutes to hours)
+  └─> build/bb/bb.o
+      build/bb/bb.h
+      build/bb/ios-link.xcconfig
+
+./scripts/build-demo-app           stage 2 — link iOS app (.app bundle)
+  └─> MobileTest.app
+#+END_SRC
+
+** Usage
+
+#+BEGIN_SRC bash
+GRAALVM_HOME=/path/to/gluon/Contents/Home ./scripts/build-bb-o
+#+END_SRC
+
+By default ~CLOJURE_DIR~ points at ~../grease~. Override it to compile any
+Clojure project that has a ~deps.edn~ and a ~uberjar-basic~ build alias:
+
+#+BEGIN_SRC bash
+GRAALVM_HOME=... CLOJURE_DIR=/path/to/my-app ./scripts/build-bb-o
+#+END_SRC
+
+Speed up subsequent builds by reusing the CAPCache:
+
+#+BEGIN_SRC bash
+USE_CAP_CACHE=use GRAALVM_HOME=... ./scripts/build-bb-o
+#+END_SRC
+
+** Outputs
+
+| File | Description |
+|------+-------------|
+| ~build/bb/bb.o~ | Relocatable iOS arm64 object (~100 MB); link into your Xcode app |
+| ~build/bb/bb.h~ | C header exposing all compiled Clojure entry points |
+| ~build/bb/graal_isolate.h~ | GraalVM isolate/thread management API |
+| ~build/bb/ios-link.xcconfig~ | Xcode config: library search paths + linker flags |
+
+** Wiring into Xcode
+
+1. Set the Xcode target's configuration file to ~build/bb/ios-link.xcconfig~
+2. Add ~build/bb/bb.o~ to *Linked Frameworks and Libraries*
+3. Add ~build/bb/~ to *Header Search Paths* (for ~bb.h~)
+4. *Remove* from your Xcode target — they are now bundled in ~libjvm.a~:
+   - ~JvmFuncsFallbacks.c~ from *Compile Sources*
+   - ~libdarwin.a~ and ~liblibchelper.a~ from *Linked Frameworks and Libraries*
+
+** Library layout used at link time
+
+#+BEGIN_EXAMPLE
+build/ios-arm64/
+├── lib/   ← iOS-targeted (searched first)
+│   ├── libjava.a  java.base + net + nio + extnet native layer
+│   └── libjvm.a   SubstrateVM + libdarwin + liblibchelper + JvmFuncsFallbacks
+└── static/ ← POSIX-safe arm64 (searched second)
+    ├── libzip.a
+    ├── libprefs.a
+    ├── libj2pkcs11.a
+    ├── libjaas.a
+    └── ... (37 more from static-libs-image)
+#+END_EXAMPLE
+
+* Building the demo app
+
+~scripts/build-demo-app~ links ~bb.o~ and the ios-graal-jdk-21 static libraries
+into the grease ~MobileTest~ iOS app via ~xcodebuild~.
+
+** Prerequisites
+
+- ~./scripts/build-bb-o~ completed (~build/bb/bb.o~ exists)
+- Xcode 14.3.1 active (~xcode-select -p~ returns the 14.3.1 path)
+- ~GREASE_DIR~ pointing at a checked-out grease repository (default: ~../grease~)
+
+** Usage
+
+#+BEGIN_SRC bash
+./scripts/build-demo-app
+#+END_SRC
+
+#+BEGIN_SRC bash
+# Release build
+CONFIGURATION=Release ./scripts/build-demo-app
+
+# Simulator build
+DESTINATION="platform=iOS Simulator,name=iPhone 15" ./scripts/build-demo-app
+#+END_SRC
+
+** What the script does
+
+1. *Stages* ~bb.o~ and headers — symlinks ~build/bb/bb.o~ into the path the
+   Xcode project hardcodes (~grease/library/build/out/bb.o~) and stages
+   ~bb.h~ / ~graal_isolate.h~ into ~grease/library/~ where the existing
+   ~HEADER_SEARCH_PATHS~ will find them.
+
+2. *Writes* ~build/demo-app.xcconfig~ overriding:
+   - ~LIBRARY_SEARCH_PATHS~ → ios-graal-jdk-21 ~lib/~ and ~static/~
+   - ~OTHER_LDFLAGS~ → updated flags (~-ljava -ljvm -lzip -lprefs -lj2pkcs11 -ljaas~)
+   - ~EXCLUDED_SOURCE_FILE_NAMES = JvmFuncsFallbacks.c~ — prevents duplicate
+     symbols since ~libjvm.a~ already provides those symbols
+   - ~CC~ / ~CXX~ → Xcode 14.3.1 clang explicitly
+   - Code signing disabled for unsigned / CI builds
+
+3. *Runs* ~xcodebuild -scheme MobileTest -UseModernBuildSystem=NO~ with the
+   xcconfig and reports the ~.app~ bundle path.
+
+* Troubleshooting
+
+** ~stdio.h not found~ during xcodebuild
+
+The VFS stat cache (~SDKStatCaches.noindex/iphoneos16.4-*.sdkstatcache~) was
+generated by a different Xcode version. Fix:
+
+1. Ensure ~xcode-select -p~ returns your Xcode 14.3.1 path.
+2. Delete the stale cache:
+   #+BEGIN_SRC bash
+   rm -f ~/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphoneos16.4-*.sdkstatcache
+   #+END_SRC
+3. Re-run ~./build.sh~. The cache is regenerated automatically.
+
+** ~adlc~ killed (exit 137 / SIGKILL)
+
+The JDK ~configure~ step picked up iOS env vars (~SDKROOT~, ~CC~, ~CFLAGS~, etc.)
+from ~.envrc~ or direnv, causing ~adlc~ to be compiled as an iOS arm64 binary.
+~build.sh~ strips these vars via ~env -u~ before invoking the inner JDK build.
+If you see this error, ensure you are running the top-level ~./build.sh~ and not
+the inner one directly.
+
+** ~configure: error: cannot run C compiled programs~
+
+~SDKROOT~ was set to the iOS SDK. Same root cause as above. Let ~build.sh~ handle
+the env stripping.

@@ -52,7 +52,7 @@ jobs:
 
       # ── System dependencies ───────────────────────────────────────────────
       - name: Install build tools
-        run: brew install mx
+        run: brew install mx autoconf
 
       # ── Boot JDK (labsjdk-ce-21) ──────────────────────────────────────────
       - name: Cache Boot JDK

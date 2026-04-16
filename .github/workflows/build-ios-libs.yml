@@ -8,6 +8,7 @@ name: Build iOS JDK libraries
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -161,3 +162,17 @@ jobs:
           name: ios-jdk-libs-arm64
           path: build/ios-arm64/
           retention-days: 30
+
+      # ── GitHub Release (tag pushes only) ──────────────────────────────────
+      - name: Create release archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd build
+          zip -r ios-jdk-libs-arm64.zip ios-arm64/
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/ios-jdk-libs-arm64.zip
+          generate_release_notes: true

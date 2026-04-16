@@ -3,8 +3,12 @@ build/
 labs-openjdk/build/
 svm/build/
 
-# ── Boot JDK (fetched via mx fetch-jdk) ──────────────────────────────────────
+# ── Boot JDK and local JDK test installs ─────────────────────────────────────
 boot-jdk-21/
+jdk-test/
+
+# ── Developer workflow scripts (canonical copy lives in the grease project) ──
+scripts/
 
 # ── GraalVM CAP cache (stale native code causes silent test failures) ─────────
 conf/capcache/
